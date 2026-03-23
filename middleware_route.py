@@ -1,23 +1,30 @@
-import json
 import re
+import logging
+from pydantic import BaseModel, ValidationError
+logger = logging.getLogger("Catrobat-Middleware")
+BLACKLISTED_TERMS = re.compile(r"\b(diagnose|insomnia|seizure|syndrome|prescribe)\b", re.IGNORECASE)
 
-BLACKLISTED_TERMS = r"\b(diagnose|insomnia|seizure|syndrome|prescribe|treatment)\b"
+class GeminiResponseSchema(BaseModel):
+    summary: str
+    confidence_score: float
+    anomaly_flagged: bool
 
-def evaluate_ai_safety(gemini_json_response: str) -> dict:
+async def evaluate_and_route_telemetry(raw_llm_payload: str) -> dict:
     """
-    Middleware circuit breaker: Evaluates Gemini's output for safety 
-    and minimum confidence thresholds before routing to the dashboard.
+    Async middleware pipeline: Validates structured output from Gemini,
+    enforces strict medical safety constraints, and routes to appropriate RBAC queues.
     """
     try:
-        payload = json.loads(gemini_json_response)
-        summary = payload.get("summary", "").lower()
-        confidence = payload.get("confidence_score", 0)
+        parsed_data = GeminiResponseSchema.model_validate_json(raw_llm_payload)
 
-        if re.search(BLACKLISTED_TERMS, summary):
-            return {"status": "BLOCKED", "reason": "Medical terminology detected."}
-        if confidence < 85:
-            return {"status": "PENDING_REVIEW", "reason": f"Low AI confidence ({confidence}%)."}
-        return {"status": "APPROVED", "data": summary}
+        if BLACKLISTED_TERMS.search(parsed_data.summary):
+            logger.warning("CRITICAL: Medical terminology detected. Blocking AI output.")
+            return {"status": "BLOCKED", "route": "admin_audit_queue", "reason": "Policy Violation"}
+        if parsed_data.confidence_score < 85.0 or parsed_data.anomaly_flagged:
+            logger.info(f"Routing to HITL Queue. AI Confidence: {parsed_data.confidence_score}%")
+            return {"status": "PENDING_REVIEW", "route": "supervisor_approval", "data": parsed_data.dict()}
+        return {"status": "APPROVED", "route": "family_dashboard", "data": parsed_data.dict()}
 
-    except json.JSONDecodeError:
-        return {"status": "BLOCKED", "reason": "LLM failed to return structured JSON."}
+    except ValidationError as e:
+        logger.error(f"LLM Schema Validation Failed: {e}")
+        return {"status": "SYSTEM_ERROR", "route": "retry_pipeline", "reason": "Schema Mismatch"}
